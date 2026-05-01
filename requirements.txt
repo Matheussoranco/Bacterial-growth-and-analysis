@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.11
+pandas>=2.0
+
+# Machine learning
+scikit-learn>=1.4
+imbalanced-learn>=0.12
+xgboost>=2.0
+lightgbm>=4.3
+
+# Hyperparameter optimisation (Bayesian)
+optuna>=3.6
+
+# Explainability
+shap>=0.45
+
+# Visualisation
+matplotlib>=3.8
+
+# Model persistence
+joblib>=1.4
