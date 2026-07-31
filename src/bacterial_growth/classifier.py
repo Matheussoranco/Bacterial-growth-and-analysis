@@ -368,7 +368,12 @@ class BacterialCultureClassifier:
                 params = dict(
                     hidden_layer_sizes=hidden,
                     alpha=trial.suggest_float("alpha", 1e-5, 1e-1, log=True),
-                    learning_rate_init=trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+                    # The trial name must match the estimator kwarg: best_params
+                    # is splatted straight into MLPClassifier below, so naming
+                    # this "lr" makes that call raise TypeError.
+                    learning_rate_init=trial.suggest_float(
+                        "learning_rate_init", 1e-4, 1e-2, log=True
+                    ),
                     batch_size=trial.suggest_categorical("batch_size", [32, 64, 128]),
                 )
                 m = MLPClassifier(**params, max_iter=300, early_stopping=True,
