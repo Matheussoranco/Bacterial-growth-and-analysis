@@ -21,6 +21,12 @@ from .kinetics import GrowthKinetics, fit_growth_curve
 
 __all__ = ["KineticFeatureExtractor", "StatisticalFeatureExtractor", "extract_all_features"]
 
+# numpy>=2.0 renamed trapz -> trapezoid; fall back for numpy 1.24-1.x (still supported here).
+try:
+    _trapezoid = np.trapezoid
+except AttributeError:
+    _trapezoid = np.trapz
+
 
 class KineticFeatureExtractor(BaseEstimator, TransformerMixin):
     """Fit growth models to each curve and return kinetic parameters as features.
@@ -91,8 +97,8 @@ class StatisticalFeatureExtractor(BaseEstimator, TransformerMixin):
         rates = np.diff(log_n) / (np.diff(t) + 1e-9)
 
         # AUC via trapezoidal rule
-        auc = float(np.trapz(log_n, t))
-        auc_rate = float(np.trapz(np.maximum(rates, 0), t[:-1]))
+        auc = float(_trapezoid(log_n, t))
+        auc_rate = float(_trapezoid(np.maximum(rates, 0), t[:-1]))
 
         # Phase detection heuristic
         max_rate_idx = int(np.argmax(rates)) if len(rates) > 0 else 0
@@ -117,8 +123,8 @@ class StatisticalFeatureExtractor(BaseEstimator, TransformerMixin):
             "stat_kurtosis": _kurtosis(log_n),
             "stat_rate_std": float(np.std(rates)) if len(rates) else np.nan,
             # Early vs late growth split
-            "stat_early_auc": float(np.trapz(log_n[:n // 3], t[:n // 3])) if n > 3 else np.nan,
-            "stat_late_auc": float(np.trapz(log_n[2 * n // 3:], t[2 * n // 3:])) if n > 3 else np.nan,
+            "stat_early_auc": float(_trapezoid(log_n[:n // 3], t[:n // 3])) if n > 3 else np.nan,
+            "stat_late_auc": float(_trapezoid(log_n[2 * n // 3:], t[2 * n // 3:])) if n > 3 else np.nan,
             "stat_early_late_ratio": float(
                 np.mean(log_n[:n // 4]) / (np.mean(log_n[3 * n // 4:]) + 1e-9)
             ) if n > 4 else np.nan,
