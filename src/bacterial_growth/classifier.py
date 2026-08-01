@@ -36,7 +36,7 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
@@ -117,12 +117,27 @@ class BacterialCultureClassifier:
     # ------------------------------------------------------------------
 
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "BacterialCultureClassifier":
-        """Full training pipeline."""
-        X_proc, y_proc = self._preprocess_train(X, y)
+        """Full training pipeline.
+
+        A held-out calibration split is carved out of (X, y) *before* any
+        preprocessing/fitting happens, and conformal non-conformity scores are
+        computed on that untouched split. Computing them on the same data used
+        to fit and calibrate the ensemble (as a naive implementation would) is
+        train/calibration leakage: in-sample scores are systematically too low,
+        so the resulting prediction sets would undershoot the target coverage
+        on genuinely unseen data.
+        """
+        X_fit, X_cal, y_fit, y_cal = train_test_split(
+            X, y, test_size=0.15, stratify=y, random_state=self.random_state,
+        )
+        X_proc, y_proc = self._preprocess_train(X_fit, y_fit)
         self._classes_ = self._label_enc.classes_
         self._train_base_models(X_proc, y_proc)
         self._build_stacking_ensemble(X_proc, y_proc)
-        self._fit_conformal(X_proc, y_proc)
+
+        X_cal_proc = self._preprocess_infer(X_cal)
+        y_cal_enc = self._label_enc.transform(y_cal)
+        self._fit_conformal(X_cal_proc, y_cal_enc)
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
