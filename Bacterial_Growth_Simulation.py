@@ -1,7 +1,7 @@
 """
 Bacterial Growth Simulation — entry-point script.
 
-Run the full SOTA pipeline end-to-end:
+Run the full research-prototype pipeline end-to-end:
     python Bacterial_Growth_Simulation.py --mode pipeline
 
 Quick component demos (no heavy training):

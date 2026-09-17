@@ -1,6 +1,6 @@
 # Bacterial Growth Analysis
 
-A SOTA predictive microbiology toolkit combining mechanistic growth models, Gaussian Process Regression, and a Bayesian-optimised stacking ensemble classifier for bacterial species identification.
+A research prototype for predictive microbiology combining mechanistic growth models, Gaussian Process Regression, and a Bayesian-optimised stacking ensemble classifier for bacterial species identification. It is not a state-of-the-art claim: the current pipeline relies substantially on synthetic data and has not been validated against an external experimental benchmark.
 
 ---
 

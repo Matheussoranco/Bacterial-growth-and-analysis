@@ -67,6 +67,15 @@ class GrowthKinetics:
 # Model functions (vectorised, work in log CFU/mL)
 # ---------------------------------------------------------------------------
 
+# Small guards against division-by-zero / exp overflow in closed-form models.
+_EPS = 1e-12
+_EXP_MIN, _EXP_MAX = -500.0, 500.0
+
+
+def _safe_exp(x: np.ndarray) -> np.ndarray:
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        return np.exp(np.clip(np.asarray(x, dtype=float), _EXP_MIN, _EXP_MAX))
+
 def baranyi_roberts(t: np.ndarray, mu_max: float, lag: float,
                     log_n0: float, log_nmax: float) -> np.ndarray:
     """Baranyi-Roberts model (closed-form approximation, Baranyi & Roberts 1994).
@@ -75,11 +84,15 @@ def baranyi_roberts(t: np.ndarray, mu_max: float, lag: float,
     physiological state of cells as they adapt from lag to exponential growth.
     """
     t = np.asarray(t, dtype=float)
+    mu = max(float(mu_max), _EPS)  # guard 1/mu_max
     # A(t) = adjustment function for lag phase
-    At = t + (1.0 / mu_max) * np.log(np.exp(-mu_max * t) + np.exp(-mu_max * lag)
-                                       - np.exp(-mu_max * (t + lag)) + 1e-300)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        At = t + (1.0 / mu) * np.log(
+            _safe_exp(-mu * t) + _safe_exp(-mu * lag)
+            - _safe_exp(-mu * (t + lag)) + 1e-300)
     delta = log_nmax - log_n0
-    log_nt = log_nmax - np.log(1.0 + (np.exp(delta) - 1.0) * np.exp(-mu_max * At) + 1e-300)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        log_nt = log_nmax - np.log(1.0 + (_safe_exp(delta) - 1.0) * _safe_exp(-mu * At) + 1e-300)
     return log_nt
 
 
@@ -91,8 +104,10 @@ def modified_gompertz(t: np.ndarray, mu_max: float, lag: float,
     """
     t = np.asarray(t, dtype=float)
     A = log_nmax - log_n0
-    exponent = np.exp(1.0) * mu_max / A * (lag - t) + 1.0
-    return log_n0 + A * np.exp(-np.exp(exponent))
+    A_safe = A if abs(A) > _EPS else np.copysign(_EPS, A if A != 0 else 1.0)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        exponent = np.exp(1.0) * mu_max / A_safe * (lag - t) + 1.0
+        return log_n0 + A * np.exp(-_safe_exp(exponent))
 
 
 def logistic_growth(t: np.ndarray, mu_max: float, lag: float,
@@ -100,8 +115,11 @@ def logistic_growth(t: np.ndarray, mu_max: float, lag: float,
     """Symmetric logistic (Verhulst) model."""
     t = np.asarray(t, dtype=float)
     A = log_nmax - log_n0
-    t_inflect = lag + A / (2.0 * mu_max)
-    return log_n0 + A / (1.0 + np.exp(-4.0 * mu_max / A * (t - t_inflect)))
+    A_safe = A if abs(A) > _EPS else np.copysign(_EPS, A if A != 0 else 1.0)
+    mu = max(float(mu_max), _EPS)  # guard A/(2*mu) and mu/A
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        t_inflect = lag + A_safe / (2.0 * mu)
+        return log_n0 + A / (1.0 + _safe_exp(-4.0 * mu / A_safe * (t - t_inflect)))
 
 
 def buchanan_trilinear(t: np.ndarray, mu_max: float, lag: float,
@@ -111,7 +129,8 @@ def buchanan_trilinear(t: np.ndarray, mu_max: float, lag: float,
     Piecewise: flat lag → linear exponential → flat stationary.
     """
     t = np.asarray(t, dtype=float)
-    t_stat = lag + (log_nmax - log_n0) / mu_max
+    mu = max(float(mu_max), _EPS)  # guard /mu_max
+    t_stat = lag + (log_nmax - log_n0) / mu
     log_nt = np.where(
         t <= lag,
         log_n0,

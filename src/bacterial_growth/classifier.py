@@ -17,11 +17,33 @@ import warnings
 from pathlib import Path
 from typing import Optional
 
+import hashlib
+import inspect
 import joblib
 import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
+from sklearn import __version__ as _sklearn_version
 from sklearn.calibration import CalibratedClassifierCV
+
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN = True
+except ImportError:  # sklearn<1.6: no FrozenEstimator
+    FrozenEstimator = None  # type: ignore[assignment,misc]
+    _HAS_FROZEN = False
+
+_SKLEARN_TUPLE = tuple(
+    int(p) for p in _sklearn_version.split("+")[0].split(".")[:2]
+    if p.isdigit()
+)
+if _SKLEARN_TUPLE < (1, 6):
+    warnings.warn(
+        f"scikit-learn {_sklearn_version} < 1.6: FrozenEstimator unavailable; "
+        "calibration falls back to uncalibrated stack. Upgrade to sklearn>=1.6.",
+        UserWarning,
+        stacklevel=2,
+    )
 from sklearn.decomposition import PCA
 from sklearn.ensemble import (
     RandomForestClassifier,
@@ -67,6 +89,30 @@ except ImportError:
     _HAS_SHAP = False
 
 __all__ = ["BacterialCultureClassifier"]
+
+_CLASSIFIER_FORMAT_VERSION = 1
+
+
+def _make_xgb_classifier(**params):
+    """Build XGBClassifier compatibly across XGBoost 1.x → 3.x.
+
+    ``use_label_encoder`` was deprecated in 1.x and *removed* in XGBoost 3,
+    where passing it raises TypeError. Inspect the constructor signature and
+    only pass it when supported.
+    """
+    from xgboost import XGBClassifier as _XGB
+    try:
+        sig_params = inspect.signature(_XGB.__init__).parameters
+    except (TypeError, ValueError):
+        sig_params = {}
+    if "use_label_encoder" in sig_params:
+        try:
+            return _XGB(use_label_encoder=False, **params)
+        except TypeError:
+            pass
+    # Strip the legacy arg if caller passed it explicitly.
+    params.pop("use_label_encoder", None)
+    return _XGB(**params)
 
 
 class BacterialCultureClassifier:
@@ -133,10 +179,10 @@ class BacterialCultureClassifier:
         X_proc, y_proc = self._preprocess_train(X_fit, y_fit)
         self._classes_ = self._label_enc.classes_
         self._train_base_models(X_proc, y_proc)
-        self._build_stacking_ensemble(X_proc, y_proc)
 
         X_cal_proc = self._preprocess_infer(X_cal)
         y_cal_enc = self._label_enc.transform(y_cal)
+        self._build_stacking_ensemble(X_proc, y_proc, X_cal_proc, y_cal_enc)
         self._fit_conformal(X_cal_proc, y_cal_enc)
         return self
 
@@ -198,6 +244,13 @@ class BacterialCultureClassifier:
     def explain(self, X: pd.DataFrame, n_samples: int = 100) -> Optional[object]:
         """Return SHAP Explanation object for the top base model.
 
+        Note: this explains a single fitted *base* learner (lightgbm /
+        xgboost / random_forest, first available), NOT the stacking
+        ensemble (``self._calibrated``) used by ``predict``. SHAP on the
+        full stack would require explaining the meta-learner over
+        out-of-fold features; the base-model explanation is a fast,
+        approximate feature attribution for inspection only.
+
         Requires ``shap`` to be installed. Falls back gracefully.
         """
         if not _HAS_SHAP:
@@ -226,13 +279,71 @@ class BacterialCultureClassifier:
         return shap_values
 
     def save(self, path: str | Path) -> None:
-        joblib.dump(self.__dict__, path)
-        print(f"Model saved to {path}")
+        warnings.warn(
+            "Model is persisted with joblib/pickle. Only load files you trust; "
+            "untrusted .joblib files can execute arbitrary code on load.",
+            UserWarning,
+            stacklevel=2,
+        )
+        payload = {
+            "format_version": _CLASSIFIER_FORMAT_VERSION,
+            "state": self.__dict__,
+        }
+        joblib.dump(payload, path)
+        # SHA-256 sidecar for integrity checking on load.
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        sidecar = Path(str(path) + ".sha256")
+        sidecar.write_text(f"{h.hexdigest()}  {Path(path).name}\n")
+        print(f"Model saved to {path} (sha256: {h.hexdigest()[:16]}...)")
 
     @classmethod
     def load(cls, path: str | Path) -> "BacterialCultureClassifier":
+        data_path = Path(path)
+        sidecar = Path(str(path) + ".sha256")
+        if sidecar.exists():
+            expected = sidecar.read_text().split()[0]
+            h = hashlib.sha256()
+            with open(data_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            if h.hexdigest() != expected:
+                raise ValueError(
+                    f"SHA-256 mismatch for {data_path}: expected {expected}, "
+                    f"got {h.hexdigest()}. File may be corrupted or tampered."
+                )
+        else:
+            warnings.warn(
+                f"No SHA-256 sidecar found for {data_path}; skipping integrity check.",
+                UserWarning,
+                stacklevel=2,
+            )
+        warnings.warn(
+            "Loading a joblib/pickle file executes embedded Python objects. "
+            "Only load files from trusted sources.",
+            UserWarning,
+            stacklevel=2,
+        )
+        payload = joblib.load(data_path)
+        # Backwards compat: legacy files stored raw __dict__ without envelope.
+        if isinstance(payload, dict) and "state" in payload and "format_version" in payload:
+            if payload["format_version"] != _CLASSIFIER_FORMAT_VERSION:
+                raise ValueError(
+                    f"Unsupported classifier format version "
+                    f"{payload['format_version']} (expected {_CLASSIFIER_FORMAT_VERSION})."
+                )
+            state = payload["state"]
+        else:
+            warnings.warn(
+                "Legacy model file without format version; loading best-effort.",
+                UserWarning,
+                stacklevel=2,
+            )
+            state = payload
         obj = cls.__new__(cls)
-        obj.__dict__.update(joblib.load(path))
+        obj.__dict__.update(state)
         return obj
 
     # ------------------------------------------------------------------
@@ -244,7 +355,19 @@ class BacterialCultureClassifier:
         y_enc = self._label_enc.fit_transform(y)
 
         X_scaled = self._scaler.fit_transform(X_arr)
-        X_res, y_res = self._smote.fit_resample(X_scaled, y_enc)
+        # SMOTE guard: default k_neighbors=5 requires >= 6 samples in the
+        # minority class. Shrink k or skip SMOTE instead of crashing.
+        _, counts = np.unique(y_enc, return_counts=True)
+        min_count = int(counts.min()) if len(counts) else 0
+        if min_count < 2:
+            X_res, y_res = X_scaled, y_enc
+            warnings.warn("SMOTE disabled: a class has < 2 samples.", UserWarning)
+        elif min_count < 6:
+            k = max(1, min(5, min_count - 1))
+            smote = SMOTE(random_state=self.random_state, k_neighbors=k)
+            X_res, y_res = smote.fit_resample(X_scaled, y_enc)
+        else:
+            X_res, y_res = self._smote.fit_resample(X_scaled, y_enc)
 
         self._feature_selector = SelectFromModel(
             RandomForestClassifier(n_estimators=100, random_state=self.random_state),
@@ -328,8 +451,8 @@ class BacterialCultureClassifier:
                     reg_alpha=trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
                     reg_lambda=trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
                 )
-                m = XGBClassifier(**params, random_state=self.random_state,
-                                   eval_metric="mlogloss", verbosity=0, use_label_encoder=False)
+                m = _make_xgb_classifier(**params, random_state=self.random_state,
+                                   eval_metric="mlogloss", verbosity=0)
                 return cross_val_score(m, X, y, cv=cv, scoring="f1_weighted").mean()
 
             study = optuna.create_study(direction="maximize",
@@ -340,8 +463,8 @@ class BacterialCultureClassifier:
             best = dict(n_estimators=200, max_depth=5, learning_rate=0.1,
                         subsample=0.9, colsample_bytree=0.9)
 
-        m = XGBClassifier(**best, random_state=self.random_state,
-                          eval_metric="mlogloss", verbosity=0, use_label_encoder=False)
+        m = _make_xgb_classifier(**best, random_state=self.random_state,
+                          eval_metric="mlogloss", verbosity=0)
         return m.fit(X, y)
 
     def _tune_lgb(self, X, y, cv):
@@ -436,7 +559,21 @@ class BacterialCultureClassifier:
     # Stacking ensemble
     # ------------------------------------------------------------------
 
-    def _build_stacking_ensemble(self, X: np.ndarray, y: np.ndarray) -> None:
+    def _build_stacking_ensemble(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_cal: np.ndarray | None = None,
+        y_cal: np.ndarray | None = None,
+    ) -> None:
+        """Fit the stacking ensemble on train, calibrate on held-out data.
+
+        The stack is fitted on ``(X_train, y_train)`` only. Calibration uses
+        the separate held-out split ``(X_cal, y_cal)`` — never the same X —
+        so the isotonic map is not fitted in-sample (which would understate
+        uncertainty). ``cv="prefit"`` is deprecated since sklearn 1.6 and
+        removed in 1.8; the frozen-estimator path below is the replacement.
+        """
         estimators = [(name, model) for name, model in self._base_models.items()]
         meta = LogisticRegression(C=1.0, max_iter=1000, random_state=self.random_state)
         stack = StackingClassifier(
@@ -446,10 +583,47 @@ class BacterialCultureClassifier:
             passthrough=False,
             n_jobs=-1,
         )
-        stack.fit(X, y)
-        # Calibrate the stacking ensemble
-        self._calibrated = CalibratedClassifierCV(stack, method="isotonic", cv=3)
-        self._calibrated.fit(X, y)
+        stack.fit(X_train, y_train)
+        self._ensemble = stack
+
+        if X_cal is None or y_cal is None:
+            warnings.warn(
+                "No held-out calibration split given; using uncalibrated stack.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._calibrated = stack
+            return
+
+        if not _HAS_FROZEN:
+            warnings.warn(
+                "sklearn<1.6 without FrozenEstimator: skipping isotonic "
+                "calibration, using uncalibrated stack.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._calibrated = stack
+            return
+
+        _, counts = np.unique(y_cal, return_counts=True)
+        min_count = int(counts.min()) if len(counts) else 0
+        if min_count < 2:
+            warnings.warn(
+                "Held-out calibration split too small (<2/class); "
+                "using uncalibrated stack.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._calibrated = stack
+            return
+        cv = 3 if min_count >= 3 else 2
+        # FrozenEstimator freezes the fitted stack: CalibratedClassifierCV
+        # cross-fits only the isotonic calibrators on the held-out split,
+        # never refitting (or in-sample calibrating) the base ensemble.
+        frozen = FrozenEstimator(stack)
+        calibrated = CalibratedClassifierCV(frozen, method="isotonic", cv=cv)
+        calibrated.fit(X_cal, y_cal)
+        self._calibrated = calibrated
 
     # ------------------------------------------------------------------
     # Conformal prediction

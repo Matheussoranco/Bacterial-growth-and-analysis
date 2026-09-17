@@ -21,9 +21,12 @@ Or step-by-step:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import pandas as pd
@@ -67,7 +70,12 @@ class BacterialAnalysisPipeline:
         test_size: float = 0.2,
         random_state: int = 42,
     ):
-        self.output_dir = Path(output_dir)
+        if not output_dir:
+            raise ValueError("output_dir não pode ser vazio")
+        out = Path(output_dir)
+        if out.exists() and not out.is_dir():
+            raise ValueError(f"output_dir existe e não é diretório: {out}")
+        self.output_dir = out
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.n_curves = n_curves
         self.n_samples = n_samples
@@ -85,9 +93,7 @@ class BacterialAnalysisPipeline:
 
     def run(self) -> dict:
         """Execute the complete pipeline and return evaluation metrics."""
-        print("\n" + "=" * 65)
-        print("  Bacterial Growth Analysis Pipeline — SOTA Edition")
-        print("=" * 65)
+        logger.info("Bacterial Growth Analysis Pipeline — SOTA Edition")
 
         t0 = time.time()
         self.generate_data()
@@ -100,8 +106,8 @@ class BacterialAnalysisPipeline:
         self.save_results()
 
         elapsed = time.time() - t0
-        print(f"\nPipeline completed in {elapsed:.1f}s")
-        print(f"Results saved to {self.output_dir.resolve()}")
+        logger.info("Pipeline completed in %.1fs", elapsed)
+        logger.info("Results saved to %s", self.output_dir.resolve())
         return self.eval_metrics
 
     # ------------------------------------------------------------------
@@ -109,7 +115,7 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def generate_data(self) -> "BacterialAnalysisPipeline":
-        print("\n[1/6] Generating synthetic data ...")
+        logger.info("[1/6] Generating synthetic data ...")
         self.curves_df, self.kinetics_df = generate_growth_curves(
             n_curves=self.n_curves,
             random_state=self.random_state,
@@ -118,9 +124,9 @@ class BacterialAnalysisPipeline:
             n_samples=self.n_samples,
             random_state=self.random_state,
         )
-        print(f"  Growth curves: {self.n_curves} | Kinetics rows: {len(self.kinetics_df)}")
-        print(f"  Classification samples: {len(self.class_df)}")
-        print(f"  Class distribution:\n{self.class_df['species'].value_counts().to_string()}")
+        logger.info("Growth curves: %d | Kinetics rows: %d", self.n_curves, len(self.kinetics_df))
+        logger.info("Classification samples: %d", len(self.class_df))
+        logger.info("Class distribution:\n%s", self.class_df['species'].value_counts().to_string())
         return self
 
     # ------------------------------------------------------------------
@@ -128,7 +134,7 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def visualise_growth_curves(self) -> "BacterialAnalysisPipeline":
-        print("\n[2/6] Visualising growth curves ...")
+        logger.info("[2/6] Visualising growth curves ...")
         fig = plot_growth_curve_comparison(self.curves_df, n_per_species=4)
         save_figure(fig, self.output_dir / "growth_curves_comparison.png")
 
@@ -146,7 +152,8 @@ class BacterialAnalysisPipeline:
             from .kinetics import fit_growth_curve
             try:
                 kin = fit_growth_curve(t_arr, log_n_arr)
-            except RuntimeError:
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("fit_growth_curve pulado para %s: %s", sp, exc)
                 continue
             fig = plot_growth_curve(t_arr, log_n_arr, kinetics=kin, species=sp)
             sp_clean = sp.replace(". ", "_").replace(" ", "_")
@@ -164,20 +171,24 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def fit_growth_predictor(self) -> "BacterialAnalysisPipeline":
-        print("\n[3/6] Fitting growth predictor (GPR) ...")
+        logger.info("[3/6] Fitting growth predictor (GPR) ...")
         self.growth_predictor = GrowthPredictor()
         self.growth_predictor.fit(self.kinetics_df, condition_cols=["temperature", "pH"])
 
         # Evaluate on held-out kinetics
-        sample = self.kinetics_df.sample(20, random_state=self.random_state)
+        n_eval = min(20, len(self.kinetics_df))
+        if n_eval == 0:
+            logger.warning("No kinetics rows available for GPR evaluation; skipping.")
+            return self
+        sample = self.kinetics_df.sample(n_eval, random_state=self.random_state)
         preds = self.growth_predictor.predict(sample)
         for target in ("mu_max", "lag_time", "log_nmax"):
             mae = float(np.mean(np.abs(sample[target].values - preds[target].values)))
-            print(f"  GPR MAE {target}: {mae:.4f}")
+            logger.info("GPR MAE %s: %.4f", target, mae)
         return self
 
     def visualise_growth_boundaries(self) -> "BacterialAnalysisPipeline":
-        print("  Plotting growth boundaries ...")
+        logger.info("Plotting growth boundaries ...")
         species_list = list(self.kinetics_df["species"].unique())
         for sp in species_list:
             cpm = CardinalParameterModel(sp)
@@ -192,7 +203,7 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def train_classifier(self) -> "BacterialAnalysisPipeline":
-        print("\n[4/6] Training species classifier ...")
+        logger.info("[4/6] Training species classifier ...")
         y = self.class_df["species"].values
         X = self.class_df.drop(columns=["species"])
 
@@ -212,7 +223,7 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def evaluate(self) -> "BacterialAnalysisPipeline":
-        print("\n[5/6] Evaluating classifier ...")
+        logger.info("[5/6] Evaluating classifier ...")
         self.eval_metrics = self.classifier.evaluate(self.X_test, self.y_test)
 
         # Confusion matrix
@@ -235,8 +246,8 @@ class BacterialAnalysisPipeline:
             from .visualization import plot_conformal_coverage
             fig = plot_conformal_coverage(pred_sets, self.y_test, target_coverage=0.90)
             save_figure(fig, self.output_dir / "conformal_coverage.png")
-        except Exception as e:
-            print(f"  Warning: conformal plot skipped ({e})")
+        except (ImportError, ValueError, AttributeError) as e:
+            logger.warning("conformal plot skipped (%s: %s)", type(e).__name__, e)
 
         # ROC curves
         try:
@@ -246,8 +257,8 @@ class BacterialAnalysisPipeline:
             y_score = proba_df.values
             fig = plot_roc_curves(y_bin, y_score, class_names)
             save_figure(fig, self.output_dir / "roc_curves.png")
-        except Exception as e:
-            print(f"  Warning: ROC plot skipped ({e})")
+        except (ImportError, ValueError) as e:
+            logger.warning("ROC plot skipped (%s: %s)", type(e).__name__, e)
 
         return self
 
@@ -256,7 +267,7 @@ class BacterialAnalysisPipeline:
     # ------------------------------------------------------------------
 
     def save_results(self) -> "BacterialAnalysisPipeline":
-        print("\n[6/6] Saving results ...")
+        logger.info("[6/6] Saving results ...")
         self.classifier.save(self.output_dir / "classifier.joblib")
         self.kinetics_df.to_csv(self.output_dir / "kinetics.csv", index=False)
         self.class_df.to_csv(self.output_dir / "classification_dataset.csv", index=False)
@@ -270,5 +281,5 @@ class BacterialAnalysisPipeline:
         with open(self.output_dir / "metrics.json", "w") as f:
             json.dump(metrics_json, f, indent=2)
 
-        print(f"  Saved: {', '.join(p.name for p in sorted(self.output_dir.iterdir()))}")
+        logger.info("Saved: %s", ', '.join(p.name for p in sorted(self.output_dir.iterdir())))
         return self
